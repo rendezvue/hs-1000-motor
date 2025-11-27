@@ -13,19 +13,15 @@ ENCODER_CPR = 10000  # 엔코더 1회전 당 펄스 수 (10000 가정)
 SDO_TX_ID = 0x600 + NODE_ID  # 0x605
 NMT_ID = 0x000
 
-# 글로벌 CAN 버스 객체 (나중에 초기화)
 bus = None
 
-# 가속도 계산 로직
+# (calculate_accel_data, calculate_velocity_data 함수는 이전과 동일)
 def calculate_accel_data(rpm_per_sec, cpr):
-    """RPM/s 기반으로 가속도/감속도 값을 계산합니다."""
     scaling_factor = cpr / 60.0 
     value = int(rpm_per_sec * scaling_factor)
     return list(struct.pack('<I', value))
 
-# 속도 계산 로직
 def calculate_velocity_data(rpm, cpr):
-    """RPM 값을 counts/s로 변환합니다."""
     counts_per_second = int((rpm * cpr) / 60)
     return list(struct.pack('<I', counts_per_second))
 
@@ -33,7 +29,6 @@ def calculate_velocity_data(rpm, cpr):
 # --- 2. CAN 통신 Helper Functions (이전과 동일) ---
 
 def send_can_message(arbitration_id, data):
-    """지정된 ID와 데이터로 CAN 메시지를 전송합니다."""
     if not bus:
         messagebox.showerror("CAN 오류", "CAN 버스가 초기화되지 않았습니다.")
         return
@@ -50,7 +45,6 @@ def send_can_message(arbitration_id, data):
         return
 
 def send_sdo_write(index, subindex, data, data_len):
-    """SDO Write 명령을 전송합니다."""
     csid = {1: 0x2F, 2: 0x2B, 4: 0x23}.get(data_len)
     index_low = index & 0xFF
     index_high = (index >> 8) & 0xFF
@@ -72,7 +66,7 @@ def initialize_can_bus():
         # 1. CAN 버스 연결
         bus = can.interface.Bus(channel=CAN_INTERFACE, bustype='socketcan')
         
-        # 2. NMT 초기화, PDO 설정, Operational Enable (이전 코드의 1~4단계)
+        # 2. NMT 초기화 및 PDO 설정 (상태 전환은 run_motor에서 담당)
         send_can_message(NMT_ID, [0x81, 0x00]); time.sleep(2.0) 
         send_sdo_write(0x1017, 0x00, [0xE8, 0x03], 2); time.sleep(0.2)
         send_sdo_write(0x1600, 0x00, [0x00], 1)
@@ -81,19 +75,21 @@ def initialize_can_bus():
         send_sdo_write(0x1600, 0x00, [0x02], 1); time.sleep(0.1)
         send_sdo_write(0x1400, 0x01, [0x05, 0x02, 0x00, 0x00], 4)
         send_sdo_write(0x1400, 0x02, [0xFF], 1); time.sleep(0.1)
+        
+        # NMT Start Node (Operational 진입)
         send_can_message(NMT_ID, [0x01, NODE_ID]); time.sleep(1.0) 
-
+        
+        # DSP402 초기 상태 진입
         send_sdo_write(0x6040, 0x00, [0x80, 0x00], 2) # Fault Reset
         send_sdo_write(0x6040, 0x00, [0x00, 0x00], 2)
-        send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2) # Shutdown
-        send_sdo_write(0x6040, 0x00, [0x07, 0x00], 2) # Switch On
-        send_sdo_write(0x6040, 0x00, [0x0F, 0x00], 2) # Operation Enable
-        time.sleep(0.5)
         
         # 3. 운전 모드 설정 (Profile Velocity Mode)
         send_sdo_write(0x6060, 0x00, [0x03], 1); time.sleep(0.1)
         
-        messagebox.showinfo("초기화 성공", "CAN 버스 연결 및 모터 Operational Enable 상태 진입 완료.")
+        # 모터를 Switch On Disabled(06h) 상태로 대기 (구동 버튼에서 0Fh로 전환)
+        send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2)
+        
+        messagebox.showinfo("초기화 성공", "CAN 버스 연결 및 모터 준비 완료.")
     
     except Exception as e:
         messagebox.showerror("초기화 실패", f"CAN 버스 초기화 실패: {e}")
@@ -103,7 +99,10 @@ def initialize_can_bus():
 
 
 def run_motor():
-    """입력된 RPM 및 가속/감속 값으로 모터를 구동합니다."""
+    """
+    모터를 Operation Enable 상태로 전환하고 입력된 값으로 구동합니다.
+    **Switch On Disabled -> Operation Enable 시퀀스 추가됨.**
+    """
     if not bus:
         messagebox.showerror("CAN 오류", "먼저 'CAN 초기화' 버튼을 눌러 버스를 연결하세요.")
         return
@@ -114,18 +113,24 @@ def run_motor():
         accel_rps = float(entry_accel.get())
         decel_rps = float(entry_decel.get())
         
-        # 1. 속도, 가속도, 감속도 데이터 계산
+        # 1. 모터를 Operation Enable로 재활성화 (Shutdown -> Switch On -> Operation Enable)
+        send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2) # Shutdown (안전 보장)
+        send_sdo_write(0x6040, 0x00, [0x07, 0x00], 2) # Switch On
+        send_sdo_write(0x6040, 0x00, [0x0F, 0x00], 2) # Operation Enable
+        time.sleep(0.5) 
+        
+        # 2. 속도, 가속도, 감속도 데이터 계산
         velocity_data = calculate_velocity_data(target_rpm, ENCODER_CPR)
         accel_data = calculate_accel_data(accel_rps, ENCODER_CPR)
         decel_data = calculate_accel_data(decel_rps, ENCODER_CPR)
         
-        # 2. Profile Acceleration (6083h) 설정
+        # 3. Profile Acceleration (6083h) 설정
         send_sdo_write(0x6083, 0x00, accel_data, 4); time.sleep(0.05)
         
-        # 3. Profile Deceleration (6084h) 설정
+        # 4. Profile Deceleration (6084h) 설정
         send_sdo_write(0x6084, 0x00, decel_data, 4); time.sleep(0.05)
         
-        # 4. Target Velocity (60FFh) 설정 (구동 시작)
+        # 5. Target Velocity (60FFh) 설정 (구동 시작)
         send_sdo_write(0x60FF, 0x00, velocity_data, 4)
         
         messagebox.showinfo("구동 명령", f"모터 구동 시작: {target_rpm} RPM, 가속: {accel_rps} RPM/s")
@@ -137,28 +142,31 @@ def run_motor():
 
 
 def stop_motor():
-    """Target Velocity 0을 사용하여 모터를 감속 정지시킵니다."""
+    """Target Velocity 0을 사용하여 모터를 감속 정지시키고 비활성화합니다."""
     if not bus:
         messagebox.showerror("CAN 오류", "먼저 'CAN 초기화' 버튼을 눌러 버스를 연결하세요.")
         return
 
     try:
-        # 감속 시간 계산
+        # 입력 값 읽기 및 감속 시간 계산
         target_rpm = float(entry_rpm.get())
         decel_rps = float(entry_decel.get())
         
+        if target_rpm <= 0:
+            target_rpm = 1.0 # 0 RPM일 경우를 대비하여 최소값 설정
+            
         if decel_rps <= 0:
              decel_rps = 1.0 # 최소 감속 RPM/s
              
         decel_time = target_rpm / decel_rps
         
-        # 1. Target Velocity를 0으로 설정하여 감속 시작 (가장 부드러운 정지 방법)
+        # 1. Target Velocity를 0으로 설정하여 감속 시작 (Controlword는 0Fh 유지)
         zero_data = [0x00, 0x00, 0x00, 0x00]
         send_sdo_write(0x60FF, 0x00, zero_data, 4)
         
-        # 2. 감속 시간만큼 대기 (GUI가 멈추지 않도록 실제 앱에서는 스레드를 사용해야 함)
-        # 여기서는 간단히 time.sleep으로 구현합니다.
         messagebox.showinfo("정지 명령", f"감속 시작. 예상 감속 시간: {decel_time:.1f}초")
+        
+        # 2. 감속 시간만큼 대기
         time.sleep(decel_time + 0.5) 
         
         # 3. Control word = 06h (최종 비활성화)
@@ -166,7 +174,7 @@ def stop_motor():
         messagebox.showinfo("정지 완료", "모터 최종 정지 및 비활성화 완료.")
 
     except ValueError:
-        messagebox.showerror("입력 오류", "감속 RPM 입력 값에 문제가 있습니다.")
+        messagebox.showerror("입력 오류", "RPM/감속 RPM 입력 값에 문제가 있습니다.")
     except Exception as e:
         messagebox.showerror("정지 오류", f"모터 정지 명령 중 오류 발생: {e}")
 
@@ -176,7 +184,6 @@ def on_closing():
     global bus
     if bus:
         try:
-            # 최종 비활성화 명령 전송
             send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2)
             bus.shutdown()
         except:
@@ -184,14 +191,14 @@ def on_closing():
     root.destroy()
 
 
-# --- 4. Tkinter GUI 레이아웃 ---
+# --- 4. Tkinter GUI 레이아웃 (이전과 동일) ---
 
 root = tk.Tk()
 root.title("ELD2-CAN 모터 제어 GUI")
 root.geometry("400x350")
 
 # CAN 초기화 버튼
-btn_init = tk.Button(root, text="CAN 초기화 및 모터 활성화", command=initialize_can_bus, bg='lightblue')
+btn_init = tk.Button(root, text="CAN 초기화 및 모터 준비", command=initialize_can_bus, bg='lightblue')
 btn_init.pack(pady=10, padx=20, fill='x')
 
 # 입력 프레임
