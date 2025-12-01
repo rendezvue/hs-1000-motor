@@ -10,11 +10,11 @@ import math
 # --- 1. 설정 변수 및 계산 함수 ---
 CAN_INTERFACE = 'can0'
 NODE_ID = 5
-ENCODER_CPR = 10000  # 엔코더 1회전 당 펄스 수 (10000 가정)
-MM_PER_REV = 10.0 # 모터 1회전당 이동 거리 (mm) - 예시값
+ENCODER_CPR = 10000  # ⭐️ 실제 드라이브의 설정된 엔코더 분해능으로 변경 필요
+MM_PER_REV = 10.0 # ⭐️ 실제 '모터 축 1회전당 이송 거리(mm)'로 변경 필요
 EMCY_ID = 0x80 + NODE_ID 
 
-# ⭐️ 수정된 부분: SDO 폴링 주기 20ms 설정
+# SDO 폴링 주기 (20ms로 설정)
 SDO_POLLING_INTERVAL_SEC = 0.02 
 
 # CANopen 통신 변수
@@ -47,6 +47,12 @@ LIMIT_REVERSE_VELOCITY_RPM = 50.0 # Limit 감지 후 후퇴 속도 (50 RPM)
 # GUI 실시간 표시 변수 및 최신 위치 저장 변수
 current_position_var = None
 last_known_position_counts = 0 
+
+# GUI 위젯 변수 (Limit 기준 제어 섹션 추가를 위해 필요)
+entry_limit_target_displacement = None
+entry_limit_pos_rpm = None
+entry_limit_pos_accel = None
+
 
 # 계산 헬퍼 함수
 def calculate_accel_data(rpm_per_sec, cpr):
@@ -133,7 +139,7 @@ def position_reader_thread_func():
             except Exception as e:
                 pass
         
-        # ⭐️ 수정된 부분: SDO_POLLING_INTERVAL_SEC 사용
+        # SDO 폴링 주기 (20ms 마다 요청)
         time.sleep(SDO_POLLING_INTERVAL_SEC) 
 
 
@@ -178,7 +184,7 @@ def update_realtime_position():
             current_position_var.set(f"{position_mm:.4f} mm")
 
     if running:
-        # 100ms 대신 SDO 폴링 주기와 유사하게 갱신
+        # GUI 갱신 주기
         root.after(int(SDO_POLLING_INTERVAL_SEC * 1000), update_realtime_position) 
 
 def check_for_errors():
@@ -210,7 +216,7 @@ def check_for_errors():
             try: send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2); time.sleep(0.1)
             except: pass
             
-            # ⭐️ 수정된 로직: 1초 지연
+            # ⭐️ 안정화 지연 시간 (1초)
             time.sleep(1.0) 
             
             # 위치 저장 (지연 후 갱신된 last_known_position_counts 사용)
@@ -292,7 +298,6 @@ def check_for_errors():
             pass
 
     if running:
-        # 100ms 대신 SDO 폴링 주기와 유사하게 갱신
         root.after(int(SDO_POLLING_INTERVAL_SEC * 1000), check_for_errors)
 
 
@@ -316,7 +321,7 @@ def initialize_can_bus():
         position_reader_thread = threading.Thread(target=position_reader_thread_func, daemon=True)
         position_reader_thread.start() 
 
-        # ⭐️ 수정된 부분: GUI 갱신 주기 변경
+        # GUI 갱신 주기 시작
         root.after(int(SDO_POLLING_INTERVAL_SEC * 1000), check_for_errors)
         root.after(int(SDO_POLLING_INTERVAL_SEC * 1000), update_realtime_position) 
         
@@ -396,6 +401,58 @@ def run_absolute_position_mode():
         messagebox.showerror("입력 오류", "위치 모드: 모든 입력 값은 숫자여야 합니다.")
     except Exception as e:
         messagebox.showerror("구동 오류", f"위치 모드 명령 중 오류 발생: {e}")
+
+
+def run_limit_based_position_mode():
+    """Limit 기준 (Bottom=0mm)으로 상대 위치 이동을 명령합니다."""
+    global bottom_limit_mm
+    
+    if not bus:
+        messagebox.showerror("CAN 오류", "먼저 'CAN 초기화' 버튼을 눌러 버스를 연결하세요.")
+        return
+    
+    if bottom_limit_mm is None:
+        messagebox.showerror("Limit 오류", "Bottom Limit 값이 설정되지 않았습니다. 'Bottom 찾기'를 먼저 실행하세요.")
+        return
+
+    try:
+        # 1. Limit 기준 상대 변위 (mm)
+        target_displacement_mm = float(entry_limit_target_displacement.get()) 
+        velocity_rpm = float(entry_limit_pos_rpm.get())
+        accel_rps = float(entry_limit_pos_accel.get())
+        
+        # 2. 최종 절대 목표 위치 계산 (Bottom Limit = 0mm 기준)
+        target_absolute_mm = bottom_limit_mm + target_displacement_mm
+
+        # 3. 모터 상태 전환 및 파라미터 설정 (Absolute Position Mode 재활용)
+        send_sdo_write(0x6060, 0x00, [0x01], 1); time.sleep(0.05)
+        send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2)
+        send_sdo_write(0x6040, 0x00, [0x07, 0x00], 2)
+        send_sdo_write(0x6040, 0x00, [0x0F, 0x00], 2)
+        time.sleep(0.5)
+        
+        # 4. 데이터 변환 및 전송
+        position_data = mm_to_encoder_counts(target_absolute_mm, MM_PER_REV, ENCODER_CPR)
+        velocity_data = calculate_velocity_data(velocity_rpm, ENCODER_CPR)
+        accel_data = calculate_accel_data(accel_rps, ENCODER_CPR)
+        
+        send_sdo_write(0x6081, 0x00, velocity_data, 4); time.sleep(0.05)
+        send_sdo_write(0x6083, 0x00, accel_data, 4); time.sleep(0.05)
+        send_sdo_write(0x6084, 0x00, accel_data, 4); time.sleep(0.05) 
+        send_sdo_write(0x607A, 0x00, position_data, 4) 
+
+        # 5. 구동 시작
+        send_sdo_write(0x6040, 0x00, [0x1F, 0x00], 2) 
+        send_sdo_write(0x6040, 0x00, [0x0F, 0x00], 2) 
+        
+        messagebox.showinfo("Limit 기준 위치 구동", 
+                            f"Limit 기준 {target_displacement_mm} mm (절대 위치: {target_absolute_mm:.4f} mm)로 이동")
+
+    except ValueError:
+        messagebox.showerror("입력 오류", "Limit 기준 위치 모드: 모든 입력 값은 숫자여야 합니다.")
+    except Exception as e:
+        messagebox.showerror("구동 오류", f"Limit 기준 위치 모드 명령 중 오류 발생: {e}")
+
 
 def position_stop_motor():
     """6. 모터를 멈추는 명령을 보냅니다. (Disable Voltage -> Quick Stop)"""
@@ -483,7 +540,7 @@ def on_closing():
 
 root = tk.Tk()
 root.title("ELD2-CAN 모터 제어 GUI (SDO 폴링)")
-root.geometry("500x670") 
+root.geometry("500x850") # GUI 높이 확장
 
 btn_init = tk.Button(root, text="CAN 초기화 및 모터 준비", command=initialize_can_bus, bg='lightblue')
 btn_init.pack(pady=10, padx=20, fill='x')
@@ -524,6 +581,7 @@ top_limit_var = tk.StringVar()
 top_limit_var.set("N/A")
 entry_top_limit = tk.Entry(top_frame, textvariable=top_limit_var, state='readonly', width=15)
 entry_top_limit.pack(side='left', expand=True, fill='x', padx=5, pady=2)
+
 
 # -----------------
 # [섹션 1: 절대 위치 제어] 
@@ -569,6 +627,41 @@ btn_pos_run.pack(side='left', expand=True, fill='x', padx=5)
 
 btn_pos_stop = tk.Button(button_frame_pos, text="6. ■ 위치이동 정지", command=position_stop_motor, bg='salmon')
 btn_pos_stop.pack(side='right', expand=True, fill='x', padx=5)
+
+
+# -----------------
+# ⭐️ [섹션 2: Limit 기준 위치 제어] ⭐️
+# -----------------
+tk.Label(root, text="--- 2. Limit 기준 위치 제어 (Bottom=0mm) ---", font=('Helvetica', 10, 'bold')).pack(pady=10)
+limit_position_frame = tk.Frame(root, bd=1, relief=tk.SOLID)
+limit_position_frame.pack(pady=5, padx=20, fill='x')
+
+limit_input_frame = tk.Frame(limit_position_frame)
+limit_input_frame.pack(pady=5, padx=5)
+
+tk.Label(limit_input_frame, text="1. 목표 Top 변위 (mm)").grid(row=0, column=0, padx=5, pady=2, sticky='w')
+entry_limit_target_displacement = tk.Entry(limit_input_frame)
+entry_limit_target_displacement.insert(0, "10.0") 
+entry_limit_target_displacement.grid(row=0, column=1, padx=5, pady=2)
+
+tk.Label(limit_input_frame, text="2. 속도 RPM").grid(row=1, column=0, padx=5, pady=2, sticky='w')
+entry_limit_pos_rpm = tk.Entry(limit_input_frame)
+entry_limit_pos_rpm.insert(0, "100")
+entry_limit_pos_rpm.grid(row=1, column=1, padx=5, pady=2)
+
+tk.Label(limit_input_frame, text="3. 가속도 RPM/s").grid(row=2, column=0, padx=5, pady=2, sticky='w')
+entry_limit_pos_accel = tk.Entry(limit_input_frame)
+entry_limit_pos_accel.insert(0, "200.0")
+entry_limit_pos_accel.grid(row=2, column=1, padx=5, pady=2)
+
+limit_button_frame = tk.Frame(limit_position_frame)
+limit_button_frame.pack(pady=5, padx=5, fill='x')
+
+btn_limit_pos_run = tk.Button(limit_button_frame, text="4. ▶ Limit기준 위치 구동", command=run_limit_based_position_mode, bg='#FFE0B2')
+btn_limit_pos_run.pack(side='left', expand=True, fill='x', padx=5)
+
+btn_limit_pos_stop = tk.Button(limit_button_frame, text="5. ■ 위치이동 정지", command=position_stop_motor, bg='salmon')
+btn_limit_pos_stop.pack(side='right', expand=True, fill='x', padx=5)
 
 
 root.protocol("WM_DELETE_WINDOW", on_closing)
