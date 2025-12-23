@@ -2,299 +2,232 @@ import can
 import time
 import struct
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import scrolledtext, ttk
 import threading
 import queue
-import math
 
-# --- 1. 설정 변수 및 계산 함수 ---
+# --- 1. 디자인 및 설정 상수 ---
+COLOR_BG_DARK = '#1E1E1E'
+COLOR_TEXT_RPM = '#00FF00'
+COLOR_TEXT_TEMP = '#FFA500' 
+COLOR_BTN_INIT = '#D1E8FF'
+COLOR_BTN_RUN = '#C1FFC1'
+COLOR_BTN_STOP = '#FFC1C1'
+FONT_DASHBOARD = ('Consolas', 22, 'bold')
+FONT_LOG = ('Consolas', 9)
+
 CAN_INTERFACE = 'can0'
 NODE_ID = 5
-ENCODER_CPR = 10000  # 엔코더 1회전 당 펄스 수 (10000 가정)
-EMCY_ID = 0x80 + NODE_ID  # Node 5의 Emergency Object (EMCY) ID: 0x85
-
-# CANopen 통신 변수
-SDO_TX_ID = 0x600 + NODE_ID  # 0x605
+ENCODER_CPR = 10000
+SDO_TX_ID = 0x600 + NODE_ID
 NMT_ID = 0x000
 
-# 글로벌 CAN 통신 및 스레딩 변수
+# 글로벌 제어 변수
 bus = None
-error_queue = queue.Queue()  
-can_thread = None
-running = False 
+bus_lock = threading.Lock()
+log_queue = queue.Queue()
+current_task_id = 0  # 작업 충돌 방지를 위한 ID
+motor_state = "IDLE"
+state_lock = threading.Lock()
 
-def calculate_accel_data(rpm_per_sec, cpr):
-    """RPM/s 기반으로 가속도/감속도 값을 계산합니다. (항상 양수)"""
-    scaling_factor = cpr / 60.0 
-    value = int(rpm_per_sec * scaling_factor)
-    return list(struct.pack('<I', value))
+# 모니터링 데이터
+actual_rpm = 0.0
+actual_torque_pct = 0.0
+actual_overload_val = 0.0
+actual_temp = 0.0 
 
-def calculate_velocity_data(rpm, cpr):
-    """
-    RPM 값을 counts/s (부호 포함)로 변환합니다.
-    **포맷이 '<i' (Signed 32-bit Integer)로 변경되었습니다.**
-    """
-    # RPM에 따라 counts/s도 부호를 가집니다.
-    counts_per_second = int((rpm * cpr) / 60)
-    # '<i': Little Endian, Signed Integer (4 bytes)
-    return list(struct.pack('<i', counts_per_second))
+# --- 2. 통신 함수 ---
+def log(message):
+    log_queue.put(f"[{time.strftime('%H:%M:%S')}] {message}")
 
-
-# --- 2. CAN 통신 Helper Functions (이전과 동일) ---
-
-def send_can_message(arbitration_id, data):
-    """지정된 ID와 데이터로 CAN 메시지를 전송합니다."""
-    if not bus:
-        messagebox.showerror("CAN 오류", "CAN 버스가 초기화되지 않았습니다.")
-        return
-    data_padded = data + [0x00] * (8 - len(data))
-    message = can.Message(
-        arbitration_id=arbitration_id,
-        data=data_padded,
-        is_extended_id=False
-    )
-    try:
-        bus.send(message)
-    except can.exceptions.CanOperationError as e:
-        messagebox.showerror("CAN 전송 오류", f"메시지 전송 실패: {e}")
-        return
+def send_can_raw(arbitration_id, data):
+    if not bus: return
+    msg = can.Message(arbitration_id=arbitration_id, data=data + [0]*(8-len(data)), is_extended_id=False)
+    with bus_lock:
+        try: bus.send(msg)
+        except Exception as e: log(f"❌ CAN Error: {e}")
 
 def send_sdo_write(index, subindex, data, data_len):
-    """SDO Write 명령을 전송합니다."""
     csid = {1: 0x2F, 2: 0x2B, 4: 0x23}.get(data_len)
-    index_low = index & 0xFF
-    index_high = (index >> 8) & 0xFF
+    payload = [csid, index & 0xFF, (index >> 8) & 0xFF, subindex] + data
+    send_can_raw(SDO_TX_ID, payload)
+
+# --- 3. 모니터링 루틴 (매뉴얼 주소 반영) ---
+def monitor_motor_status():
+    global actual_rpm, actual_torque_pct, actual_overload_val, actual_temp
+    if not bus: return
     
-    sdo_data = data
-    payload = [csid, index_low, index_high, subindex] + sdo_data
-    send_can_message(SDO_TX_ID, payload)
-
-
-# --- 3. 비동기 CAN 리스너 및 GUI 업데이트 (이전과 동일) ---
-
-def can_listener_thread():
-    """백그라운드에서 CAN 메시지를 수신하고 EMCY 메시지를 큐에 추가합니다."""
-    global running
-    while running:
+    with bus_lock:
         try:
-            msg = bus.recv(timeout=0.1) 
+            # 1. 실제 속도 (0x606C)
+            bus.send(can.Message(arbitration_id=SDO_TX_ID, data=[0x40, 0x6C, 0x60, 0x00, 0, 0, 0, 0], is_extended_id=False))
+            reply = bus.recv(timeout=0.005)
+            if reply and reply.data[1:3] == b'\x6C\x60':
+                raw_vel = struct.unpack('<i', reply.data[4:8])[0]
+                actual_rpm = (raw_vel * 60.0) / ENCODER_CPR
+
+            # 2. 실제 토크 (0x6077) - 0.1% 단위
+            bus.send(can.Message(arbitration_id=SDO_TX_ID, data=[0x40, 0x77, 0x60, 0x00, 0, 0, 0, 0], is_extended_id=False))
+            reply = bus.recv(timeout=0.005)
+            if reply and reply.data[1:3] == b'\x77\x60':
+                actual_torque_pct = abs(struct.unpack('<h', reply.data[4:6])[0] / 10.0)
+
+            # 3. 드라이버 온도 (매뉴얼 Index 0x2033)
+            bus.send(can.Message(arbitration_id=SDO_TX_ID, data=[0x40, 0x33, 0x20, 0x00, 0, 0, 0, 0], is_extended_id=False))
+            reply = bus.recv(timeout=0.005)
+            if reply and reply.data[1:3] == b'\x33\x20':
+                actual_temp = float(struct.unpack('<h', reply.data[4:6])[0])
+
+            # 4. 오버로드 부하율 (매뉴얼 Index 0x200F)
+            bus.send(can.Message(arbitration_id=SDO_TX_ID, data=[0x40, 0x0F, 0x20, 0x00, 0, 0, 0, 0], is_extended_id=False))
+            reply = bus.recv(timeout=0.005)
+            if reply and reply.data[1:3] == b'\x0F\x20':
+                 actual_overload_val = float(struct.unpack('<h', reply.data[4:6])[0])
+        except: pass
+
+def monitor_loop():
+    while True:
+        if bus and motor_state != "INITIALIZING": monitor_motor_status()
+        time.sleep(0.001)
+
+# --- 4. 제어 로직 (중단 및 재개 기능 포함) ---
+def task_initialize():
+    global bus, motor_state
+    try:
+        with state_lock: motor_state = "INITIALIZING"
+        log("🔄 초기화 시작...")
+        with bus_lock:
+            if bus: bus.shutdown()
+            bus = can.interface.Bus(channel=CAN_INTERFACE, interface='socketcan')
+        
+        send_can_raw(NMT_ID, [0x81, 0x00]); time.sleep(2.0) # Reset
+        send_sdo_write(0x1017, 0x00, [0xE8, 0x03], 2); time.sleep(0.1)
+        send_can_raw(NMT_ID, [0x01, NODE_ID]); time.sleep(0.5) # Start
+        
+        send_sdo_write(0x6060, 0x00, [0x03], 1)       # Mode: Velocity
+        send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2) # Shutdown
+        log("✅ 준비 완료")
+        with state_lock: motor_state = "IDLE"
+    except Exception as e: log(f"❌ 초기화 실패: {e}")
+
+def task_run_motor(rpm, accel, decel):
+    global current_task_id, motor_state
+    if not bus: return
+    with state_lock:
+        current_task_id += 1 # 작업 ID 증가 (이전 정지 시퀀스 무력화)
+        motor_state = "RUNNING"
+    
+    # 구동 시퀀스 (이미 돌고 있어도 덮어쓰기)
+    send_sdo_write(0x6040, 0x00, [0x0F, 0x00], 2)
+    accel_val = int(accel * (ENCODER_CPR / 60.0))
+    decel_val = int(decel * (ENCODER_CPR / 60.0))
+    vel_val = int((rpm * ENCODER_CPR) / 60)
+    
+    send_sdo_write(0x6083, 0x00, list(struct.pack('<I', accel_val)), 4)
+    send_sdo_write(0x6084, 0x00, list(struct.pack('<I', decel_val)), 4)
+    send_sdo_write(0x60FF, 0x00, list(struct.pack('<i', vel_val)), 4)
+    log(f"▶ 구동 시작: {rpm} RPM")
+
+def task_stop_motor(rpm, decel):
+    global current_task_id, motor_state
+    if not bus: return
+    
+    # [개선] 이미 정지 중이거나 정지 상태라면 명령 무시
+    with state_lock:
+        if motor_state == "STOPPING":
+            log("⚠️ 이미 감속 정지 중입니다.")
+            return
+        if motor_state == "IDLE":
+            log("ℹ️ 모터가 이미 정지 상태입니다.")
+            return
             
-            if msg and msg.arbitration_id == EMCY_ID:
-                error_code = struct.unpack('<H', bytes(msg.data[:2]))[0]
-                error_register = msg.data[2]
-                error_queue.put((error_code, error_register, msg.data))
-                
-        except AttributeError:
-            break
-        except Exception as e:
-            print(f"리스너 스레드 오류: {e}")
-            break
-
-def check_for_errors():
-    """메인 GUI 스레드에서 주기적으로 오류 큐를 확인하고 메시지를 표시합니다."""
-    if not error_queue.empty():
-        error_code, error_register, raw_data = error_queue.get()
-        data_hex = ' '.join(f'{b:02X}' for b in raw_data)
-        
-        error_message = (
-            f"CANopen Emergency Message (EMCY) 수신!\n\n"
-            f"오류 코드 (EMCY Error Code): 0x{error_code:04X}\n"
-            f"오류 레지스터 (Standard Error Reg): 0x{error_register:02X}\n"
-            f"원시 데이터: {data_hex}\n\n"
-            f"모터 드라이브에 오류가 발생했습니다. 매뉴얼을 참조하십시오."
-        )
-        messagebox.showerror("🚨 모터 오류 발생 🚨", error_message)
-        
-        # 오류 발생 시 안전을 위해 모터 비활성화 명령 전송
-        try:
-            send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2)
-        except:
-             pass
-
-    if running:
-        root.after(100, check_for_errors)
-
-
-# --- 4. GUI 컨트롤러 함수 ---
-
-def initialize_can_bus():
-    """CAN 버스를 초기화하고 Operational 상태로 전환하며, 리스너 스레드를 시작합니다."""
-    global bus, can_thread, running
+        current_task_id += 1
+        this_id = current_task_id
+        motor_state = "STOPPING"
     
-    try:
-        if bus: bus.shutdown()
-        
-        # 1. CAN 버스 연결 및 리스너 스레드 시작
-        bus = can.interface.Bus(channel=CAN_INTERFACE, bustype='socketcan')
-        running = True
-        can_thread = threading.Thread(target=can_listener_thread, daemon=True)
-        can_thread.start()
-        root.after(100, check_for_errors)
-        
-        # 2. NMT 초기화, PDO 설정, DSP402 초기 상태 진입
-        send_can_message(NMT_ID, [0x81, 0x00]); time.sleep(2.0) 
-        send_sdo_write(0x1017, 0x00, [0xE8, 0x03], 2); time.sleep(0.2)
-        send_sdo_write(0x1600, 0x00, [0x00], 1)
-        send_sdo_write(0x1600, 0x01, [0x10, 0x00, 0x40, 0x60], 4) 
-        send_sdo_write(0x1600, 0x02, [0x20, 0x00, 0xFF, 0x60], 4)
-        send_sdo_write(0x1600, 0x00, [0x02], 1); time.sleep(0.1)
-        send_sdo_write(0x1400, 0x01, [0x05, 0x02, 0x00, 0x00], 4)
-        send_sdo_write(0x1400, 0x02, [0xFF], 1); time.sleep(0.1)
-        send_can_message(NMT_ID, [0x01, NODE_ID]); time.sleep(1.0) 
-
-        # Fault Reset 및 초기 상태 설정
-        send_sdo_write(0x6040, 0x00, [0x80, 0x00], 2)
-        send_sdo_write(0x6040, 0x00, [0x00, 0x00], 2)
-        send_sdo_write(0x6060, 0x00, [0x03], 1); time.sleep(0.1)
-        send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2) 
-        
-        messagebox.showinfo("초기화 성공", "CAN 버스 연결 및 리스너 시작, 모터 준비 완료.")
+    log(f"■ 감속 정지 시작 (ID: {this_id})")
+    send_sdo_write(0x60FF, 0x00, [0,0,0,0], 4) # 속도 0 명령
     
-    except Exception as e:
-        messagebox.showerror("초기화 실패", f"CAN 버스 초기화 실패: {e}")
-        running = False
-        if can_thread and can_thread.is_alive(): can_thread.join(timeout=0.2)
-        if bus: bus.shutdown()
-        bus = None
-
-def run_motor():
-    """모터를 Operation Enable 상태로 전환하고 입력된 값으로 구동합니다."""
-    if not bus:
-        messagebox.showerror("CAN 오류", "먼저 'CAN 초기화' 버튼을 눌러 버스를 연결하세요.")
-        return
-
-    try:
-        # 입력 값 읽기 (부호 포함)
-        target_rpm = float(entry_rpm.get())
-        accel_rps = float(entry_accel.get())
-        decel_rps = float(entry_decel.get())
-        
-        # 1. 모터를 Operation Enable로 재활성화
-        send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2)
-        send_sdo_write(0x6040, 0x00, [0x07, 0x00], 2)
-        send_sdo_write(0x6040, 0x00, [0x0F, 0x00], 2)
-        time.sleep(0.5) 
-        
-        # 2. 속도, 가속도, 감속도 데이터 계산
-        velocity_data = calculate_velocity_data(target_rpm, ENCODER_CPR)
-        accel_data = calculate_accel_data(accel_rps, ENCODER_CPR)
-        decel_data = calculate_accel_data(decel_rps, ENCODER_CPR)
-        
-        # 3. 가속/감속 및 속도 설정
-        send_sdo_write(0x6083, 0x00, accel_data, 4); time.sleep(0.05)
-        send_sdo_write(0x6084, 0x00, decel_data, 4); time.sleep(0.05)
-        send_sdo_write(0x60FF, 0x00, velocity_data, 4) # 부호가 포함된 속도 데이터 전송
-        
-        direction = "정방향" if target_rpm >= 0 else "역방향"
-        messagebox.showinfo("구동 명령", f"모터 구동 시작: {target_rpm} RPM ({direction}), 가속: {accel_rps} RPM/s")
-
-    except ValueError:
-        messagebox.showerror("입력 오류", "모든 입력 값은 숫자여야 합니다.")
-    except Exception as e:
-        messagebox.showerror("구동 오류", f"모터 구동 명령 중 오류 발생: {e}")
-
-
-def stop_motor():
-    """Target Velocity 0을 사용하여 모터를 감속 정지시키고 비활성화합니다."""
-    if not bus:
-        messagebox.showerror("CAN 오류", "먼저 'CAN 초기화' 버튼을 눌러 버스를 연결하세요.")
-        return
-
-    try:
-        # 입력 값 읽기
-        target_rpm = float(entry_rpm.get())
-        decel_rps = float(entry_decel.get())
-        
-        # 감속 시간 계산 시 속도의 '절대값' 사용
-        target_rpm_abs = abs(target_rpm)
-        
-        if target_rpm_abs <= 0: target_rpm_abs = 1.0
-        if decel_rps <= 0: decel_rps = 1.0
-             
-        decel_time = target_rpm_abs / decel_rps # 시간은 항상 양수
-        
-        # 1. Target Velocity를 0으로 설정하여 감속 시작
-        zero_data = [0x00, 0x00, 0x00, 0x00]
-        send_sdo_write(0x60FF, 0x00, zero_data, 4)
-        
-        messagebox.showinfo("정지 명령", f"감속 시작. 예상 감속 시간: {decel_time:.1f}초")
-        
-        # 2. 감속 시간만큼 대기
-        time.sleep(decel_time + 0.5) 
-        
-        # 3. Control word = 06h (최종 비활성화)
-        send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2)
-        messagebox.showinfo("정지 완료", "모터 최종 정지 및 비활성화 완료.")
-
-    except ValueError:
-        messagebox.showerror("입력 오류", "RPM/감속 RPM 입력 값에 문제가 있습니다.")
-    except Exception as e:
-        messagebox.showerror("정지 오류", f"모터 정지 명령 중 오류 발생: {e}")
-
-
-def on_closing():
-    """GUI 종료 시 CAN 버스를 정리하고 스레드를 종료합니다."""
-    global bus, running
+    # 감속 대기 루프 (재구동 시 this_id != current_task_id 조건에 의해 파기됨)
+    decel_time = abs(rpm / decel) if decel > 0 else 1
+    steps = int(decel_time * 20) + 10
+    for _ in range(steps):
+        # 재구동 버튼이 눌려 ID가 바뀌면 이 정지 루프를 즉시 탈출
+        if this_id != current_task_id: 
+            return 
+        time.sleep(0.05)
     
-    running = False 
-    if can_thread and can_thread.is_alive():
-        can_thread.join(timeout=0.2) 
-
-    if bus:
-        try:
-            send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2)
-            bus.shutdown()
-        except:
-            pass
-    root.destroy()
-
-
-# --- 5. Tkinter GUI 레이아웃 (이전과 동일) ---
-
+    # 루프를 정상 종료했다면(중간에 가로채기 없었다면) 비활성화
+    if this_id == current_task_id:
+        send_sdo_write(0x6040, 0x00, [0x06, 0x00], 2) # Disable Operation
+        with state_lock: motor_state = "IDLE"
+        log("✅ 완전 정지 완료")
+# --- 5. GUI 구성 ---
 root = tk.Tk()
-root.title("ELD2-CAN 모터 제어 GUI")
-root.geometry("400x350")
+root.title("ELD2-CAN70 Monitoring System")
+root.geometry("480x820")
 
-# CAN 초기화 버튼
-btn_init = tk.Button(root, text="CAN 초기화 및 모터 준비", command=initialize_can_bus, bg='lightblue')
-btn_init.pack(pady=10, padx=20, fill='x')
+db_frame = tk.Frame(root, bg=COLOR_BG_DARK, pady=15)
+db_frame.pack(fill='x', padx=20, pady=10)
 
-# 입력 프레임
-input_frame = tk.Frame(root)
-input_frame.pack(pady=10, padx=20)
+rpm_container = tk.Frame(db_frame, bg=COLOR_BG_DARK)
+rpm_container.pack(side='left', expand=True)
+tk.Label(rpm_container, text="VELOCITY", bg=COLOR_BG_DARK, fg='white', font=('Arial', 9)).pack()
+lbl_rpm = tk.Label(rpm_container, text="0.0 RPM", bg=COLOR_BG_DARK, fg=COLOR_TEXT_RPM, font=FONT_DASHBOARD)
+lbl_rpm.pack()
 
-# 텍스트박스 1: RPM (음수 입력 가능)
-tk.Label(input_frame, text="1. 목표 RPM (예: -200)").grid(row=0, column=0, padx=5, pady=5, sticky='w')
-entry_rpm = tk.Entry(input_frame)
-entry_rpm.insert(0, "200")
-entry_rpm.grid(row=0, column=1, padx=5, pady=5)
+temp_container = tk.Frame(db_frame, bg=COLOR_BG_DARK)
+temp_container.pack(side='right', expand=True)
+tk.Label(temp_container, text="DRIVE TEMP (0x2033)", bg=COLOR_BG_DARK, fg='white', font=('Arial', 9)).pack()
+lbl_temp = tk.Label(temp_container, text="0°C", bg=COLOR_BG_DARK, fg=COLOR_TEXT_TEMP, font=FONT_DASHBOARD)
+lbl_temp.pack()
 
-# 텍스트박스 2: 가속 RPM/s
-tk.Label(input_frame, text="2. 가속 RPM/s (예: 50)").grid(row=1, column=0, padx=5, pady=5, sticky='w')
-entry_accel = tk.Entry(input_frame)
-entry_accel.insert(0, "50.0")
-entry_accel.grid(row=1, column=1, padx=5, pady=5)
+torque_frame = tk.Frame(root, padx=20)
+torque_frame.pack(fill='x', pady=5)
+tk.Label(torque_frame, text="Torque (%)", font=('Arial', 9, 'bold')).pack(side='left')
+lbl_torque_text = tk.Label(torque_frame, text="0.0 %")
+lbl_torque_text.pack(side='right')
+torque_bar = ttk.Progressbar(root, orient='horizontal', length=400, mode='determinate')
+torque_bar.pack(padx=20, pady=5, fill='x')
 
-# 텍스트박스 3: 감속 RPM/s
-tk.Label(input_frame, text="3. 감속 RPM/s (예: 50)").grid(row=2, column=0, padx=5, pady=5, sticky='w')
-entry_decel = tk.Entry(input_frame)
-entry_decel.insert(0, "50.0")
-entry_decel.grid(row=2, column=1, padx=5, pady=5)
+overload_frame = tk.Frame(root, padx=20)
+overload_frame.pack(fill='x', pady=5)
+tk.Label(overload_frame, text="Over-load Ratio (0x200F)", font=('Arial', 9, 'bold'), fg='red').pack(side='left')
+lbl_overload_text = tk.Label(overload_frame, text="0.0 %", font=('Arial', 9, 'bold'), fg='red')
+lbl_overload_text.pack(side='right')
 
-# 버튼 프레임
-button_frame = tk.Frame(root)
-button_frame.pack(pady=10, padx=20, fill='x')
+def update_gui():
+    lbl_rpm.config(text=f"{actual_rpm:.1f} RPM")
+    lbl_temp.config(text=f"{actual_temp:.0f}°C")
+    lbl_torque_text.config(text=f"{actual_torque_pct:.1f} %")
+    torque_bar['value'] = actual_torque_pct
+    lbl_overload_text.config(text=f"{actual_overload_val:.1f} %")
+    while not log_queue.empty():
+        msg = log_queue.get()
+        log_area.configure(state='normal')
+        log_area.insert(tk.END, msg + "\n")
+        log_area.see(tk.END)
+        log_area.configure(state='disabled')
+    root.after(50, update_gui)
 
-# 버튼 1: 모터 동작
-btn_run = tk.Button(button_frame, text="▶ 모터 구동", command=run_motor, bg='lightgreen')
-btn_run.pack(side='left', expand=True, fill='x', padx=5)
+btn_init = tk.Button(root, text="CAN 통신 초기화", command=lambda: threading.Thread(target=task_initialize, daemon=True).start(), bg=COLOR_BTN_INIT, height=2)
+btn_init.pack(pady=5, fill='x', padx=20)
 
-# 버튼 2: 모터 정지
-btn_stop = tk.Button(button_frame, text="■ 모터 정지", command=stop_motor, bg='salmon')
-btn_stop.pack(side='right', expand=True, fill='x', padx=5)
+input_frame = tk.LabelFrame(root, text="제어 설정")
+input_frame.pack(pady=5, padx=20, fill='x')
+entry_rpm = tk.Entry(input_frame); entry_rpm.insert(0, "1000"); entry_rpm.grid(row=0, column=1)
+tk.Label(input_frame, text="RPM").grid(row=0, column=0)
+entry_accel = tk.Entry(input_frame); entry_accel.insert(0, "100"); entry_accel.grid(row=1, column=1)
+tk.Label(input_frame, text="가속").grid(row=1, column=0)
+entry_decel = tk.Entry(input_frame); entry_decel.insert(0, "100"); entry_decel.grid(row=2, column=1)
+tk.Label(input_frame, text="감속").grid(row=2, column=0)
 
-# 창 닫기 시 이벤트 처리
-root.protocol("WM_DELETE_WINDOW", on_closing)
+tk.Button(root, text="▶ 모터 구동", command=lambda: threading.Thread(target=task_run_motor, args=(float(entry_rpm.get()), float(entry_accel.get()), float(entry_decel.get())), daemon=True).start(), bg=COLOR_BTN_RUN, height=2, font=('Arial', 10, 'bold')).pack(pady=5, fill='x', padx=20)
+tk.Button(root, text="■ 감속 정지", command=lambda: threading.Thread(target=task_stop_motor, args=(float(entry_rpm.get()), float(entry_decel.get())), daemon=True).start(), bg=COLOR_BTN_STOP, height=2, font=('Arial', 10, 'bold')).pack(pady=5, fill='x', padx=20)
 
-# GUI 실행
+log_area = scrolledtext.ScrolledText(root, height=10, state='disabled', bg=COLOR_BG_DARK, fg='white', font=FONT_LOG)
+log_area.pack(pady=10, padx=20, fill='both', expand=True)
+
+threading.Thread(target=monitor_loop, daemon=True).start()
+update_gui()
 root.mainloop()
